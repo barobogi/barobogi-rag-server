@@ -13,6 +13,7 @@
 """
 
 import os
+import time
 import requests
 from typing import List, Optional
 
@@ -26,21 +27,7 @@ def reciprocal_rank_fusion(
 ) -> List[RetrievedDocument]:
     """
     RRF(Reciprocal Rank Fusion) 알고리즘.
-
-    여러 검색 결과 리스트를 하나로 합쳐 최종 순위를 결정합니다.
-    score = Σ 1 / (k + rank_i)  (각 결과물이 속한 순위 리스트의 합)
-
-    Parameters
-    ----------
-    rankings:
-        검색 결과 리스트들의 목록.
-    k:
-        RRF 상수 (기본: 60, 원래 논문 권장값).
-
-    Returns
-    -------
-    List[RetrievedDocument]
-        RRF 점수로 재정렬된 상위 문서 목록.
+    score = Σ 1 / (k + rank_i)
     """
     doc_scores: dict[str, float] = {}
     doc_map: dict[str, RetrievedDocument] = {}
@@ -48,13 +35,9 @@ def reciprocal_rank_fusion(
     for ranking in rankings:
         for rank, doc in enumerate(ranking, start=1):
             rrf_score = 1.0 / (k + rank)
-            if doc.id in doc_scores:
-                doc_scores[doc.id] += rrf_score
-            else:
-                doc_scores[doc.id] = rrf_score
+            doc_scores[doc.id] = doc_scores.get(doc.id, 0.0) + rrf_score
             doc_map[doc.id] = doc
 
-    # RRF 점수 기준 내림차순 정렬
     sorted_ids = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
 
     results = []
@@ -94,33 +77,68 @@ class QueryDB:
 
     def run_query(self, question: str, top_k: int = 3) -> str:
         """
-        질문에 대한 답변을 생성합니다.
-
-        1) Dense 검색 Top-10
-        2) 키워드 검색 Top-10
-        3) RRF로 Top-3 재정렬
-        4) LLM에 전달 → 답변
+        일반 REST API용 질의 (기본 설정).
         """
-        # 1. Dense 검색 (의미론적)
+        return self._run_internal(question, top_k, max_tokens=1024)
+
+    def run_kakao_query(self, question: str, top_k: int = 3) -> str:
+        """
+        카카오톡 챗봇용 질의 (짧고 빠른 응답, 5초 타임아웃).
+        - max_tokens: 120 (3줄 이내)
+        - timeout: 5초 (카카오 규정)
+        - 시스템 프롬프트: 이모지 포함 짧은 답변
+        """
+        return self._run_internal(
+            question,
+            top_k,
+            max_tokens=120,
+            timeout=5,
+            system_prompt="카카오톡 답변이므로 이모지를 적절히 섞어 2~3줄로 매우 짧고 친절하게 핵심만 요약해서 답변해 주세요.",
+        )
+
+    def _run_internal(
+        self,
+        question: str,
+        top_k: int = 3,
+        max_tokens: int = 1024,
+        timeout: Optional[int] = None,
+        system_prompt: Optional[str] = None,
+    ) -> str:
+        """
+        내부 질의 실행 (공통 로직).
+        """
+        # 1. Dense 검색
         query_dense = self.embeddings.get_dense_embedding(question)
         dense_results = self.vector_store.search_dense(query_dense, top_k=10)
 
-        # 2. 키워드 검색 (BM25)
+        # 2. 키워드 검색
         keyword_results = self.vector_store.search_keyword(question, top_k=10)
 
-        # 3. RRF 융합 → Top-3
+        # 3. RRF 융합
         fused = reciprocal_rank_fusion([dense_results, keyword_results], k=60)
         top_docs = fused[:top_k]
 
-        # 4. 프롬프트 구성
+        # 4. 컨텍스트 구성
         context = "\n\n".join(doc.text for doc in top_docs)
-        prompt = self._build_prompt(context, question)
 
-        # 5. LLM 호출
-        answer = self._query_llm(prompt)
+        # 5. 프롬프트 구성
+        if system_prompt:
+            prompt = f"""다음 문서를 참고하여 질문에 답변해주세요.
+
+문서:
+{context}
+
+질문: {question}
+
+답변:"""
+        else:
+            prompt = self._build_default_prompt(context, question)
+
+        # 6. LLM 호출
+        answer = self._query_llm(prompt, max_tokens=max_tokens, timeout=timeout)
         return answer
 
-    def _build_prompt(self, context: str, question: str) -> str:
+    def _build_default_prompt(self, context: str, question: str) -> str:
         if context:
             return f"""다음 문서를 참고하여 질문에 답변해주세요.
 
@@ -139,22 +157,41 @@ class QueryDB:
 
     # ── LLM 호출 ──
 
-    def _query_llm(self, prompt: str) -> str:
-        if self.llm_api_key:
-            return self._query_openai_compatible(prompt)
-        else:
-            return self._query_basic(prompt)
+    def _query_llm(
+        self,
+        prompt: str,
+        max_tokens: int = 1024,
+        timeout: Optional[int] = None,
+    ) -> str:
+        if timeout is None:
+            timeout = self.TIMEOUT
 
-    def _query_basic(self, prompt: str) -> str:
-        payload = {"model": self.llm_model, "prompt": prompt, "stream": False}
+        if self.llm_api_key:
+            return self._query_openai_compatible(prompt, max_tokens, timeout)
+        else:
+            return self._query_basic(prompt, max_tokens, timeout)
+
+    def _query_basic(
+        self, prompt: str, max_tokens: int = 1024, timeout: int = 120
+    ) -> str:
+        payload = {
+            "model": self.llm_model,
+            "prompt": prompt,
+            "stream": False,
+            "max_tokens": max_tokens,
+        }
         try:
-            resp = requests.post(self.llm_api_url, json=payload, timeout=self.TIMEOUT)
+            resp = requests.post(self.llm_api_url, json=payload, timeout=timeout)
             resp.raise_for_status()
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"LLM API 호출 실패: {e}") from e
         return resp.json().get("response", "")
 
-    def _query_openai_compatible(self, prompt: str) -> str:
+    def _query_openai_compatible(
+        self, prompt: str, max_tokens: int = 1024, timeout: int = 120
+    ) -> str:
+        system_content = "당신은 한국어로 답변하는 유용한 AI 어시스턴트입니다."
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.llm_api_key}",
@@ -162,15 +199,15 @@ class QueryDB:
         payload = {
             "model": self.llm_model,
             "messages": [
-                {"role": "system", "content": "당신은 한국어로 답변하는 유용한 AI 어시스턴트입니다."},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.7,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
         }
         try:
             resp = requests.post(
-                self.llm_api_url, headers=headers, json=payload, timeout=self.TIMEOUT
+                self.llm_api_url, headers=headers, json=payload, timeout=timeout
             )
             resp.raise_for_status()
         except requests.exceptions.RequestException as e:
