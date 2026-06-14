@@ -203,16 +203,37 @@ async def kakao_webhook(request: Request):
                 },
             }
 
-        # [임시 개조] xAI API 타임아웃 우회를 위한 치트키 초고속 테스트 모드
-        # query_db 및 외부 API 호출 무거운 로직 우회
-        return {
+        # [초고속 우회 모드] xAI API 타임아웃 완전 우회
+        # 하이브리드 검색기를 사용하여 DB에서 상위 1개 청크를 가져와 0.1초만에 리턴합니다.
+        try:
+            # 1. Dense 임베딩 생성
+            query_dense = query_db.embeddings.get_dense_embedding(utterance)
+            # 2. Dense 검색 (Top-5)
+            dense_results = query_db.vector_store.search_dense(query_dense, top_k=5)
+            # 3. 키워드 검색 (Top-5)
+            keyword_results = query_db.vector_store.search_keyword(utterance, top_k=5)
+            
+            # 4. RRF 융합 정렬
+            from src.query_db import reciprocal_rank_fusion
+            fused = reciprocal_rank_fusion([dense_results, keyword_results], k=60)
+            
+            if fused:
+                top_chunk = fused[0].text
+                answer = f"🤖 [RAG 검색 결과 바로가기]\n{top_chunk[:400]}"
+            else:
+                answer = "죄송합니다. 관련 등록 지식을 찾지 못했습니다."
+        except Exception as query_err:
+            answer = f"검색 중 오류가 발생했습니다: {str(query_err)}"
+
+        elapsed = time.time() - start_time
+        response = {
             "version": "2.0",
             "template": {
-                "outputs": [
-                    { "simpleText": { "text": "🤖 [BaroBogi RAG 인프라 통신 테스트 성공!] Money Tree는 동아시아에서 자라는 번영의 나무입니다." } }
-                ]
-            }
+                "outputs": [{"simpleText": {"text": answer}}]
+            },
         }
+        logger.info(f"[Kakao Response Bypass] elapsed={elapsed:.3f}s | answer={answer[:80]}...")
+        return response
 
     except Exception as e:
         elapsed = time.time() - start_time if 'start_time' in locals() else 0
