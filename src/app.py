@@ -172,19 +172,25 @@ async def kakao_webhook(request: Request):
     try:
         start_time = time.time()
 
-        # 1. 요청 body 파싱 (안전하게)
+        # 1. 요청 body 파싱 + RAW 로그 출력
         body = {}
         try:
             body = await request.json()
-        except Exception:
-            logger.warning("[Kakao] JSON 파싱 실패, 빈 body 사용")
+            print(f"[Kakao Raw Body]: {body}")
+        except Exception as e:
+            print(f"[Kakao Body Parse Error]: {e}")
+            logger.warning(f"[Kakao] JSON 파싱 실패: {e}, 빈 body 사용")
 
-        # 2. utterance 안전 추출 (카카오 규격 엄격 준수)
-        user_request = body.get("userRequest", {})
+        # 2. 다중 .get() 안전 체인 추출
+        user_request = body.get("userRequest")
         if not isinstance(user_request, dict):
             user_request = {}
-        utterance = user_request.get("utterance", "").strip()
+        utterance = user_request.get("utterance")
+        if not isinstance(utterance, str):
+            utterance = ""
+        utterance = utterance.strip()
 
+        print(f"[Kakao Parsed Question]: {utterance}")
         logger.info(f"[Kakao Request] utterance={utterance}")
 
         if not utterance:
@@ -213,8 +219,18 @@ async def kakao_webhook(request: Request):
 
     except Exception as e:
         elapsed = time.time() - start_time if 'start_time' in locals() else 0
+        error_msg = f"서버 내부 에러 발생: {str(e)}"
+        print(f"[Kakao Error Log]: {error_msg}")
         logger.error(f"[Kakao Error] elapsed={elapsed:.2f}s | error={e}")
-        return KAKAO_ERROR_RESPONSE
+        # 실제 에러 메시지를 카카오톡 말풍선에 출력
+        return {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {"simpleText": {"text": error_msg}}
+                ]
+            },
+        }
 
 
 # ── 디스코드/범용 웹훅 ──
