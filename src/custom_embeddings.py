@@ -1,42 +1,53 @@
 """
-텍스트 임베딩 생성 모듈.
+하이브리드 임베딩 생성 모듈 (Pure Python + NumPy).
 
-Ollama 임베딩이 지원되지 않는 환경에서는 TF-IDF 기반
-단순 텍스트 유사도를 사용하여 임베딩을 생성합니다.
+1. TF-IDF 기반 키워드 임베딩
+2. Dense 임베딩: 외부 임베딩 API(OpenAI 호환) 또는 NumPy 기반 경량 해시 임베딩
+
+의존성: numpy (선택), 표준 라이브러리만으로도 동작
 """
 
 import re
 import math
+import os
+import hashlib
 from collections import Counter
 from typing import List, Optional
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
 
 class CustomEmbeddings:
-    """텍스트 임베딩 생성 클래스."""
+    """하이브리드 임베딩 생성 클래스 (키워드 + Dense)."""
+
+    DENSE_DIM: int = 256  # Dense 임베딩 차원 (경량 해시 기반)
 
     def __init__(self):
-        """임베딩 클래스 초기화."""
-        self._idf_cache = {}
         self._vocab = {}
         self._vocab_idx = 0
+        self._dense_api_url = os.environ.get("EMBEDDING_API_URL", "")
+        self._dense_api_key = os.environ.get("EMBEDDING_API_KEY", "")
+        self._dense_model = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+
+    # ── 토큰화 ──
 
     def _tokenize(self, text: str) -> List[str]:
-        """텍스트를 토큰으로 분리합니다."""
-        # 한국어, 영어, 숫자를 토큰으로 분리
-        tokens = re.findall(r'[가-힣]+|[a-zA-Z]+|[0-9]+', text.lower())
-        return tokens
+        return re.findall(r'[가-힣]+|[a-zA-Z]+|[0-9]+', text.lower())
+
+    # ── TF-IDF 키워드 임베딩 ──
 
     def _build_vocab(self, texts: List[str]):
-        """어휘 사전을 구축합니다."""
         for text in texts:
-            tokens = self._tokenize(text)
-            for token in tokens:
+            for token in self._tokenize(text):
                 if token not in self._vocab:
                     self._vocab[token] = self._vocab_idx
                     self._vocab_idx += 1
 
     def _compute_tf(self, text: str) -> dict:
-        """TF(Term Frequency)를 계산합니다."""
         tokens = self._tokenize(text)
         token_count = Counter(tokens)
         total = len(tokens)
@@ -45,84 +56,108 @@ class CustomEmbeddings:
         return {token: count / total for token, count in token_count.items()}
 
     def _compute_idf(self, documents: List[str]) -> dict:
-        """IDF(Inverse Document Frequency)를 계산합니다."""
         n_docs = len(documents)
-        idf = {}
-        
-        # 각 토큰이 문서에 나타나는 횟수 계산
         doc_freq = {}
         for doc in documents:
-            tokens = set(self._tokenize(doc))
-            for token in tokens:
+            for token in set(self._tokenize(doc)):
                 doc_freq[token] = doc_freq.get(token, 0) + 1
-        
-        # IDF 계산
-        for token, freq in doc_freq.items():
-            idf[token] = math.log(n_docs / (1 + freq)) + 1
-        
-        return idf
+        return {t: math.log(n_docs / (1 + f)) + 1 for t, f in doc_freq.items()}
 
-    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+    def get_tfidf_embedding(self, text: str, idf: Optional[dict] = None) -> List[float]:
+        if not self._vocab:
+            self._build_vocab([text])
+        if idf is None:
+            idf = self._compute_idf([text])
+        tf = self._compute_tf(text)
+        tfidf = [tf.get(t, 0.0) * idf.get(t, 0.0) for t in sorted(self._vocab.keys())]
+        norm = math.sqrt(sum(x * x for x in tfidf))
+        if norm > 0:
+            tfidf = [x / norm for x in tfidf]
+        return tfidf
+
+    # ── Dense 임베딩 ──
+
+    def _hash_embedding(self, text: str) -> List[float]:
         """
-        여러 텍스트의 임베딩을 일괄 생성합니다.
-
-        Parameters
-        ----------
-        texts:
-            임베딩을 생성할 텍스트 목록.
-
-        Returns
-        -------
-        List[List[float]]
-            생성된 임베딩 벡터 목록.
+        NumPy 기반 경량 해시 임베딩.
+        텍스트의 n-gram을 해시하여 고정 차원 벡터를 생성합니다.
         """
-        if not texts:
-            return []
+        ngram_range = (2, 4)
+        dim = self.DENSE_DIM
 
-        # 어휘 사전 구축
-        self._build_vocab(texts)
-        
-        # IDF 계산
-        idf = self._compute_idf(texts)
-        
-        # TF-IDF 벡터 생성
-        embeddings = []
-        for text in texts:
-            tf = self._compute_tf(text)
-            tfidf = []
-            
-            # 어휘 사전 순서대로 TF-IDF 값 계산
-            for token in sorted(self._vocab.keys()):
-                tf_val = tf.get(token, 0.0)
-                idf_val = idf.get(token, 0.0)
-                tfidf.append(tf_val * idf_val)
-            
-            # 정규화
-            norm = math.sqrt(sum(x * x for x in tfidf))
+        if HAS_NUMPY:
+            vec = np.zeros(dim, dtype=np.float64)
+        else:
+            vec = [0.0] * dim
+
+        for n in range(ngram_range[0], ngram_range[1] + 1):
+            for i in range(len(text) - n + 1):
+                ngram = text[i:i + n]
+                h = int(hashlib.md5(ngram.encode("utf-8")).hexdigest(), 16)
+                idx = h % dim
+                sign = 1.0 if (h // dim) % 2 == 0 else -1.0
+                if HAS_NUMPY:
+                    vec[idx] += sign
+                else:
+                    vec[idx] += sign
+
+        # L2 정규화
+        if HAS_NUMPY:
+            norm = np.linalg.norm(vec)
             if norm > 0:
-                tfidf = [x / norm for x in tfidf]
-            
-            embeddings.append(tfidf)
-        
-        return embeddings
+                vec = vec / norm
+            return vec.tolist()
+        else:
+            norm = math.sqrt(sum(x * x for x in vec))
+            if norm > 0:
+                vec = [x / norm for x in vec]
+            return vec
+
+    def _api_embedding(self, text: str) -> Optional[List[float]]:
+        """
+        외부 임베딩 API(OpenAI 호환)를 호출합니다.
+        EMBEDDING_API_URL 환경 변수가 설정되어 있을 때만 동작합니다.
+        """
+        if not self._dense_api_url:
+            return None
+
+        import requests as _req
+
+        headers = {"Content-Type": "application/json"}
+        if self._dense_api_key:
+            headers["Authorization"] = f"Bearer {self._dense_api_key}"
+
+        payload = {"model": self._dense_model, "input": text}
+
+        try:
+            resp = _req.post(
+                self._dense_api_url, headers=headers, json=payload, timeout=30
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["data"][0]["embedding"]
+        except Exception as e:
+            print(f"[WARN] 외부 임베딩 API 호출 실패: {e}")
+            return None
+
+    def get_dense_embedding(self, text: str) -> List[float]:
+        """
+        Dense 임베딩 벡터를 생성합니다.
+        1순위: 외부 임베딩 API (EMBEDDING_API_URL 설정 시)
+        2순위: NumPy 기반 경량 해시 임베딩 (로컬, 무설치)
+        """
+        # 외부 API 시도
+        api_result = self._api_embedding(text)
+        if api_result is not None:
+            return api_result
+
+        # 로컬 해시 임베딩
+        return self._hash_embedding(text)
+
+    # ── 호환 인터페이스 ──
 
     def get_embedding(self, text: str, model: Optional[str] = None) -> List[float]:
-        """
-        단일 텍스트의 임베딩을 생성합니다.
+        return self.get_dense_embedding(text)
 
-        Parameters
-        ----------
-        text:
-            임베딩을 생성할 텍스트.
-        model:
-            사용할 모델 이름 (사용되지 않음, 호환성을 위해 유지).
-
-        Returns
-        -------
-        List[float]
-            생성된 임베딩 벡터.
-        """
-        # 단일 텍스트의 경우 더미 문서와 함께 처리
-        dummy_docs = [text, "임베딩 생성을 위한 더미 텍스트"]
-        embeddings = self.get_embeddings_batch(dummy_docs)
-        return embeddings[0] if embeddings else []
+    def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        return [self.get_dense_embedding(t) for t in texts]

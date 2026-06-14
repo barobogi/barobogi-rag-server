@@ -1,14 +1,14 @@
 """
-질의 처리 파이프라인.
+하이브리드 RAG 질의 처리 파이프라인.
 
-1. 질문을 임베딩으로 변환
-2. 벡터 저장소에서 유사 문서 검색
-3. 외부 LLM API에 프롬프트 전달
-4. 생성된 답변 반환
+1. 질문을 Dense + 키워드 임베딩으로 변환
+2. 벡터 저장소에서 Dense 검색(Top-10) + 키워드 검색(Top-10) 수행
+3. RRF(Reciprocal Rank Fusion)로 최종 Top-3 재정렬
+4. 외부 LLM API에 프롬프트 전달 → 답변 생성
 
 환경 변수:
-- LLM_API_URL: LLM API 엔드포인트 URL (기본: http://host.docker.internal:11434/api/generate)
-- LLM_API_KEY: 외부 API 키 (있으면 OpenAI ChatCompletion 규격, 없으면 Ollama 규격)
+- LLM_API_URL: LLM API 엔드포인트 URL
+- LLM_API_KEY: 외부 API 키 (있으면 OpenAI ChatCompletion 규격)
 - LLM_MODEL: 사용할 모델 이름 (기본: qwen2.5:0.5b)
 """
 
@@ -16,12 +16,63 @@ import os
 import requests
 from typing import List, Optional
 
-from .vector_store import VectorStore
+from .vector_store import VectorStore, RetrievedDocument
 from .custom_embeddings import CustomEmbeddings
 
 
+def reciprocal_rank_fusion(
+    rankings: List[List[RetrievedDocument]],
+    k: int = 60,
+) -> List[RetrievedDocument]:
+    """
+    RRF(Reciprocal Rank Fusion) 알고리즘.
+
+    여러 검색 결과 리스트를 하나로 합쳐 최종 순위를 결정합니다.
+    score = Σ 1 / (k + rank_i)  (각 결과물이 속한 순위 리스트의 합)
+
+    Parameters
+    ----------
+    rankings:
+        검색 결과 리스트들의 목록.
+    k:
+        RRF 상수 (기본: 60, 원래 논문 권장값).
+
+    Returns
+    -------
+    List[RetrievedDocument]
+        RRF 점수로 재정렬된 상위 문서 목록.
+    """
+    doc_scores: dict[str, float] = {}
+    doc_map: dict[str, RetrievedDocument] = {}
+
+    for ranking in rankings:
+        for rank, doc in enumerate(ranking, start=1):
+            rrf_score = 1.0 / (k + rank)
+            if doc.id in doc_scores:
+                doc_scores[doc.id] += rrf_score
+            else:
+                doc_scores[doc.id] = rrf_score
+            doc_map[doc.id] = doc
+
+    # RRF 점수 기준 내림차순 정렬
+    sorted_ids = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
+
+    results = []
+    for doc_id in sorted_ids:
+        doc = doc_map[doc_id]
+        results.append(
+            RetrievedDocument(
+                id=doc.id,
+                text=doc.text,
+                score=doc_scores[doc.id],
+                method="hybrid",
+            )
+        )
+    return results
+
+
 class QueryDB:
-    """질의-응답 파이프라인을 처리하는 클래스."""
+    """하이브리드 RAG 질의-응답 파이프라인."""
 
     DEFAULT_TOP_K: int = 3
     TIMEOUT: int = 120
@@ -31,18 +82,10 @@ class QueryDB:
         vector_store: Optional[VectorStore] = None,
         embeddings: Optional[CustomEmbeddings] = None,
     ) -> None:
-        """
-        Parameters
-        ----------
-        vector_store:
-            VectorStore 인스턴스. None이면 파일 기반 DB를 사용합니다.
-        embeddings:
-            CustomEmbeddings 인스턴스. None이면 기본값으로 생성합니다.
-        """
         self.vector_store = vector_store or VectorStore()
         self.embeddings = embeddings or CustomEmbeddings()
 
-        # 환경 변수에서 설정 읽기
+        # 환경 변수
         self.llm_api_url = os.environ.get(
             "LLM_API_URL", "http://host.docker.internal:11434/api/generate"
         )
@@ -53,37 +96,31 @@ class QueryDB:
         """
         질문에 대한 답변을 생성합니다.
 
-        Parameters
-        ----------
-        question:
-            사용자 질문.
-        top_k:
-            검색할 문서 수.
-
-        Returns
-        -------
-        str
-            생성된 답변.
+        1) Dense 검색 Top-10
+        2) 키워드 검색 Top-10
+        3) RRF로 Top-3 재정렬
+        4) LLM에 전달 → 답변
         """
-        # 1. 질문 임베딩 생성
-        query_embedding = self.embeddings.get_embedding(question)
+        # 1. Dense 검색 (의미론적)
+        query_dense = self.embeddings.get_dense_embedding(question)
+        dense_results = self.vector_store.search_dense(query_dense, top_k=10)
 
-        # 2. 유사 문서 검색
-        similar_docs = self.vector_store.search(query_embedding, top_k=top_k)
+        # 2. 키워드 검색 (BM25)
+        keyword_results = self.vector_store.search_keyword(question, top_k=10)
 
-        # 3. 프롬프트 구성
-        context = "\n\n".join(doc.text for doc in similar_docs)
+        # 3. RRF 융합 → Top-3
+        fused = reciprocal_rank_fusion([dense_results, keyword_results], k=60)
+        top_docs = fused[:top_k]
+
+        # 4. 프롬프트 구성
+        context = "\n\n".join(doc.text for doc in top_docs)
         prompt = self._build_prompt(context, question)
 
-        # 4. LLM API에 질의 (API 키 유무에 따라 분기)
+        # 5. LLM 호출
         answer = self._query_llm(prompt)
-
         return answer
 
     def _build_prompt(self, context: str, question: str) -> str:
-        """
-        LLM에 전달할 프롬프트를 구성합니다.
-        """
         if context:
             return f"""다음 문서를 참고하여 질문에 답변해주세요.
 
@@ -100,106 +137,55 @@ class QueryDB:
 
 답변:"""
 
+    # ── LLM 호출 ──
+
     def _query_llm(self, prompt: str) -> str:
-        """
-        LLM API를 호출하여 답변을 생성합니다.
-        API 키가 있으면 OpenAI ChatCompletion 규격으로,
-        없으면 Ollama 기본 규격으로 요청합니다.
-        """
         if self.llm_api_key:
             return self._query_openai_compatible(prompt)
         else:
             return self._query_basic(prompt)
 
     def _query_basic(self, prompt: str) -> str:
-        """
-        API 키 없이 기본 POST 요청 (Ollama 등).
-        페이로드: {"model": ..., "prompt": ..., "stream": false}
-        """
-        payload = {
-            "model": self.llm_model,
-            "prompt": prompt,
-            "stream": False,
-        }
-
+        payload = {"model": self.llm_model, "prompt": prompt, "stream": False}
         try:
-            response = requests.post(
-                self.llm_api_url, json=payload, timeout=self.TIMEOUT
-            )
-            response.raise_for_status()
+            resp = requests.post(self.llm_api_url, json=payload, timeout=self.TIMEOUT)
+            resp.raise_for_status()
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"LLM API 호출 실패: {e}") from e
-
-        result = response.json()
-        return result.get("response", "")
+        return resp.json().get("response", "")
 
     def _query_openai_compatible(self, prompt: str) -> str:
-        """
-        API 키가 있을 때 OpenAI ChatCompletion 규격으로 요청.
-        헤더: Authorization: Bearer <API_KEY>
-        페이로드: {"model": ..., "messages": [...], "temperature": 0.7}
-        """
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.llm_api_key}",
         }
-
         payload = {
             "model": self.llm_model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "당신은 한국어로 답변하는 유용한 AI 어시스턴트입니다.",
-                },
+                {"role": "system", "content": "당신은 한국어로 답변하는 유용한 AI 어시스턴트입니다."},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.7,
             "max_tokens": 1024,
         }
-
         try:
-            response = requests.post(
+            resp = requests.post(
                 self.llm_api_url, headers=headers, json=payload, timeout=self.TIMEOUT
             )
-            response.raise_for_status()
+            resp.raise_for_status()
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"OpenAI 호환 API 호출 실패: {e}") from e
-
-        result = response.json()
+        result = resp.json()
         try:
             return result["choices"][0]["message"]["content"]
         except (KeyError, IndexError):
             return result.get("response", "")
 
+    # ── 문서 추가 ──
+
     def add_document(self, text: str) -> str:
-        """
-        문서를 추가합니다. (테스트/데모용)
-
-        Parameters
-        ----------
-        text:
-            추가할 문서 텍스트.
-
-        Returns
-        -------
-        str
-            저장된 문서 ID.
-        """
-        embedding = self.embeddings.get_embedding(text)
-        return self.vector_store.add_document(text=text, embedding=embedding)
+        dense = self.embeddings.get_dense_embedding(text)
+        return self.vector_store.add_document(text=text, dense_embedding=dense)
 
     def add_documents(self, texts: List[str]) -> List[str]:
-        """
-        여러 문서를 추가합니다. (테스트/데모용)
-
-        Parameters
-        ----------
-        texts:
-            추가할 문서 텍스트 목록.
-
-        Returns
-        -------
-        List[str]
-            저장된 문서 ID 목록.
-        """
         return [self.add_document(text) for text in texts]
