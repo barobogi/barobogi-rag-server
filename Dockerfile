@@ -44,5 +44,10 @@ EXPOSE 8000
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# LLM 설정 (환경 변수로 오버라이드 가능)
+ENV LLM_PROVIDER=ollama
+ENV LLM_MODEL=qwen2.5:0.5b
+ENV OLLAMA_URL=http://host.docker.internal:11434
+
 # 서버 실행 명령
 CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
