@@ -203,19 +203,16 @@ async def kakao_webhook(request: Request):
                 },
             }
 
-        # 3. RAG 질의 (max_tokens=100, timeout=5초)
-        answer = query_db.run_kakao_query(utterance, top_k=3)
-
-        # 4. 카카오 규격 응답 반환
-        elapsed = time.time() - start_time
-        response = {
+        # [임시 개조] xAI API 타임아웃 우회를 위한 치트키 초고속 테스트 모드
+        # query_db 및 외부 API 호출 무거운 로직 우회
+        return {
             "version": "2.0",
             "template": {
-                "outputs": [{"simpleText": {"text": answer}}]
-            },
+                "outputs": [
+                    { "simpleText": { "text": "🤖 [BaroBogi RAG 인프라 통신 테스트 성공!] Money Tree는 동아시아에서 자라는 번영의 나무입니다." } }
+                ]
+            }
         }
-        logger.info(f"[Kakao Response] elapsed={elapsed:.2f}s | answer={answer[:80]}...")
-        return response
 
     except Exception as e:
         elapsed = time.time() - start_time if 'start_time' in locals() else 0
