@@ -146,9 +146,10 @@ async def query(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── 카카오톡 챗봇 웹훅 ──
+# ── 카카오톡 챗봇 웹훅 (슬래시 유/무 모두 수용) ──
 
 @app.post("/api/kakao")
+@app.post("/api/kakao/")
 async def kakao_webhook(request: Request):
     """
     POST /api/kakao — 카카오 i 오픈빌더 스킬 서버 연동용.
