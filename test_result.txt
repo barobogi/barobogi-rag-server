@@ -1,0 +1,9 @@
+=== 테스트 시작 ===
+1. 루트: 200
+   응답: {"message":"FastAPI RAG 서버가 실행 중입니다.","endpoints":{"query":"POST /api/query - 질문하기","docs":"GET /docs - Swagger UI 문서","redoc":"GET /redoc - ReDoc 문서"}}
+
+2. /api/query 테스트:
+   Status: 200
+   응답: {"answer":"Money Tree는 아마존에서 만든 유명한 주식 인덱스입니다. 이는 투자 경험이나 전략적인 능력을 놓치지 않고 자주 성장할 수 있는 좋은 주식입니다. MONEY TREE은 2019년부터 2021년까지 증권사와 상호작용하여 매일 천만원 가격을 유지하는 인덱스입니다."}
+
+=== 테스트 완료 ===
