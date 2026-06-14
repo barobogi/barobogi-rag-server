@@ -87,14 +87,29 @@ class QueryDB:
         - LLM 우회 모드: 청크 원문 반환 (초고속)
         - 정상 모드: max_tokens=100, timeout=5초
         """
-        return self._run_internal(
-            question,
-            top_k,
-            max_tokens=100,
-            timeout=5,
-            system_prompt="카카오톡 답변이므로 이모지를 적절히 섞어 2~3줄로 매우 짧고 친절하게 핵심만 요약해서 답변해 주세요.",
-            bypass_llm=self.kakao_bypass_llm,
-        )
+        try:
+            return self._run_internal(
+                question,
+                top_k,
+                max_tokens=100,
+                timeout=5,
+                system_prompt="카카오톡 답변이므로 이모지를 적절히 섞어 2~3줄로 매우 짧고 친절하게 핵심만 요약해서 답변해 주세요.",
+                bypass_llm=self.kakao_bypass_llm,
+            )
+        except Exception as e:
+            print(f"[run_kakao_query Exception]: {e}. Attempting fallback direct retrieval...")
+            try:
+                # LLM 호출 단계 등에서 에러가 발생하면, 즉시 검색기에서 최상위 청크를 가져와 리턴합니다.
+                query_dense = self.embeddings.get_dense_embedding(question)
+                dense_results = self.vector_store.search_dense(query_dense, top_k=5)
+                keyword_results = self.vector_store.search_keyword(question, top_k=5)
+                fused = reciprocal_rank_fusion([dense_results, keyword_results], k=60)
+                if fused:
+                    top_chunk = fused[0].text
+                    return f"[임시 우회 답변 - 검색 결과 직접 반환]\n{top_chunk[:400]}"
+                return "죄송합니다. 관련 정보를 찾지 못했습니다. (Fallback)"
+            except Exception as fallback_err:
+                raise RuntimeError(f"Fallback retrieval failed: {fallback_err}") from e
 
     def _run_internal(
         self,
