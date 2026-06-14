@@ -98,6 +98,21 @@ KAKAO_ERROR_RESPONSE = {
 }
 
 
+def _extract_kakao_text(body: dict) -> str:
+    """카카오톡 본문에서 utterance를 안전하게 추출합니다."""
+    user_request = body.get("userRequest")
+    if isinstance(user_request, dict):
+        utterance = user_request.get("utterance", "").strip()
+        if utterance:
+            return utterance
+    # 폴백: 다른 키로 시도
+    for key in ["question", "text", "message", "content"]:
+        val = body.get(key)
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 def _extract_text(body: dict) -> str:
     """여러 형식의 요청에서 텍스트를 추출합니다."""
     for key in ["question", "text", "message", "content"]:
@@ -153,25 +168,26 @@ async def query(
 async def kakao_webhook(request: Request):
     """
     POST /api/kakao — 카카오 i 오픈빌더 스킬 서버 연동용.
-
-    카카오톡 → 카카오 i 오픈빌더 → 우리 서버
-    인증: 카카오 자체 토큰 검증 (별도 Bearer 불필요)
     """
-    # ★ 거대한 try-except: 어떤 에러가 나도 500 안 냄
     try:
         start_time = time.time()
 
-        # 1. 요청 파싱
+        # 1. 요청 body 파싱 (안전하게)
+        body = {}
         try:
             body = await request.json()
         except Exception:
-            body = {}
+            logger.warning("[Kakao] JSON 파싱 실패, 빈 body 사용")
 
-        question = _extract_text(body)
-        user_utterance = body.get("userRequest", {}).get("utterance", "")
-        logger.info(f"[Kakao Request] utterance={user_utterance}")
+        # 2. utterance 안전 추출 (카카오 규격 엄격 준수)
+        user_request = body.get("userRequest", {})
+        if not isinstance(user_request, dict):
+            user_request = {}
+        utterance = user_request.get("utterance", "").strip()
 
-        if not question:
+        logger.info(f"[Kakao Request] utterance={utterance}")
+
+        if not utterance:
             return {
                 "version": "2.0",
                 "template": {
@@ -181,10 +197,10 @@ async def kakao_webhook(request: Request):
                 },
             }
 
-        # 2. RAG 질의 (카카오 전용: max_tokens=120, timeout=5초)
-        answer = query_db.run_kakao_query(question, top_k=3)
+        # 3. RAG 질의 (max_tokens=100, timeout=5초)
+        answer = query_db.run_kakao_query(utterance, top_k=3)
 
-        # 3. 응답 구성
+        # 4. 카카오 규격 응답 반환
         elapsed = time.time() - start_time
         response = {
             "version": "2.0",
@@ -198,7 +214,6 @@ async def kakao_webhook(request: Request):
     except Exception as e:
         elapsed = time.time() - start_time if 'start_time' in locals() else 0
         logger.error(f"[Kakao Error] elapsed={elapsed:.2f}s | error={e}")
-        # ★ 절대 500을 반환하지 않음. 항상 카카오 규격 에러 메시지 리턴
         return KAKAO_ERROR_RESPONSE
 
 

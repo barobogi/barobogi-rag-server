@@ -10,6 +10,7 @@
 - LLM_API_URL: LLM API 엔드포인트 URL
 - LLM_API_KEY: 외부 API 키 (있으면 OpenAI ChatCompletion 규격)
 - LLM_MODEL: 사용할 모델 이름 (기본: qwen2.5:0.5b)
+- KAKAO_BYPASS_LLM: "true"면 LLM 호출 없이 청크 원문 반환 (카카오톡 속도 테스트용)
 """
 
 import os
@@ -74,26 +75,25 @@ class QueryDB:
         )
         self.llm_api_key = os.environ.get("LLM_API_KEY", "")
         self.llm_model = os.environ.get("LLM_MODEL", "qwen2.5:0.5b")
+        self.kakao_bypass_llm = os.environ.get("KAKAO_BYPASS_LLM", "").lower() == "true"
 
     def run_query(self, question: str, top_k: int = 3) -> str:
-        """
-        일반 REST API용 질의 (기본 설정).
-        """
-        return self._run_internal(question, top_k, max_tokens=1024)
+        """일반 REST API용 질의 (기본 설정)."""
+        return self._run_internal(question, top_k, max_tokens=1024, timeout=self.TIMEOUT)
 
     def run_kakao_query(self, question: str, top_k: int = 3) -> str:
         """
-        카카오톡 챗봇용 질의 (짧고 빠른 응답, 5초 타임아웃).
-        - max_tokens: 120 (3줄 이내)
-        - timeout: 5초 (카카오 규정)
-        - 시스템 프롬프트: 이모지 포함 짧은 답변
+        카카오톡 챗봇용 질의.
+        - LLM 우회 모드: 청크 원문 반환 (초고속)
+        - 정상 모드: max_tokens=100, timeout=5초
         """
         return self._run_internal(
             question,
             top_k,
-            max_tokens=120,
+            max_tokens=100,
             timeout=5,
             system_prompt="카카오톡 답변이므로 이모지를 적절히 섞어 2~3줄로 매우 짧고 친절하게 핵심만 요약해서 답변해 주세요.",
+            bypass_llm=self.kakao_bypass_llm,
         )
 
     def _run_internal(
@@ -103,10 +103,11 @@ class QueryDB:
         max_tokens: int = 1024,
         timeout: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        bypass_llm: bool = False,
     ) -> str:
-        """
-        내부 질의 실행 (공통 로직).
-        """
+        """내부 질의 실행 (공통 로직)."""
+        t0 = time.time()
+
         # 1. Dense 검색
         query_dense = self.embeddings.get_dense_embedding(question)
         dense_results = self.vector_store.search_dense(query_dense, top_k=10)
@@ -121,9 +122,17 @@ class QueryDB:
         # 4. 컨텍스트 구성
         context = "\n\n".join(doc.text for doc in top_docs)
 
+        # ★ LLM 우회: 검색된 청크 원문을 바로 반환 (초고속)
+        if bypass_llm:
+            elapsed = time.time() - t0
+            print(f"[Bypass LLM] elapsed={elapsed:.3f}s | context={context[:100]}...")
+            return context[:500] if context else "죄송합니다. 관련 정보를 찾지 못했습니다."
+
         # 5. 프롬프트 구성
         if system_prompt:
-            prompt = f"""다음 문서를 참고하여 질문에 답변해주세요.
+            prompt = f"""{system_prompt}
+
+다음 문서를 참고하여 질문에 답변해주세요.
 
 문서:
 {context}
@@ -136,6 +145,8 @@ class QueryDB:
 
         # 6. LLM 호출
         answer = self._query_llm(prompt, max_tokens=max_tokens, timeout=timeout)
+        elapsed = time.time() - t0
+        print(f"[Query] elapsed={elapsed:.2f}s | question={question[:50]}...")
         return answer
 
     def _build_default_prompt(self, context: str, question: str) -> str:
@@ -172,7 +183,7 @@ class QueryDB:
             return self._query_basic(prompt, max_tokens, timeout)
 
     def _query_basic(
-        self, prompt: str, max_tokens: int = 1024, timeout: int = 120
+        self, prompt: str, max_tokens: int = 100, timeout: int = 5
     ) -> str:
         payload = {
             "model": self.llm_model,
@@ -188,7 +199,7 @@ class QueryDB:
         return resp.json().get("response", "")
 
     def _query_openai_compatible(
-        self, prompt: str, max_tokens: int = 1024, timeout: int = 120
+        self, prompt: str, max_tokens: int = 100, timeout: int = 5
     ) -> str:
         system_content = "당신은 한국어로 답변하는 유용한 AI 어시스턴트입니다."
 
